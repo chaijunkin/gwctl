@@ -108,7 +108,7 @@ func (f *getFlags) ToOptions(args []string, factory common.Factory, iostreams ge
 	}
 
 	var err error
-	o.isPolicy, o.isPolicyCRD, err = parseResourceTypeOrNameArgs(args)
+	o.resourceTypes, err = parseResourceTypeOrNameArgs(args)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +127,15 @@ func (f *getFlags) ToOptions(args []string, factory common.Factory, iostreams ge
 	return o, nil
 }
 
+type resourceTypeConfig struct {
+	isPolicy      bool
+	isPolicyCRD   bool
+	hasPolicy     bool
+	hasPolicyCRD  bool
+	policyOrder   []string // track order of resource types requested
+	hasOtherTypes bool     // track if there are non-policy resource types
+}
+
 type getOptions struct {
 	isDescribe bool
 
@@ -137,21 +146,63 @@ type getOptions struct {
 	labelSelector string
 	output        printer.OutputFormat
 
-	isPolicy    bool
-	isPolicyCRD bool
+	resourceTypes *resourceTypeConfig
 
 	genericclioptions.IOStreams
 }
 
 func (o *getOptions) Run(args []string) error {
-	if o.isPolicy || o.isPolicyCRD {
-		return o.handlePolicy(args)
+	// Handle mixed types: separate policy types from other types
+	var policyTypes []string
+	var otherTypes []string
+
+	// Separate resource types into policy and non-policy
+	resourceArg := args[0]
+	if strings.Contains(resourceArg, ",") {
+		types := strings.Split(resourceArg, ",")
+		for _, t := range types {
+			t = strings.TrimSpace(t)
+			switch t {
+			case "policy", "policies", "policycrd", "policycrds":
+				policyTypes = append(policyTypes, t)
+			default:
+				otherTypes = append(otherTypes, t)
+			}
+		}
+	} else {
+		switch resourceArg {
+		case "policy", "policies", "policycrd", "policycrds":
+			policyTypes = append(policyTypes, resourceArg)
+		default:
+			otherTypes = append(otherTypes, resourceArg)
+		}
 	}
+
+	// If we have policy types, handle them first
+	if len(policyTypes) > 0 {
+		policyArgsStr := strings.Join(policyTypes, ",")
+		policyArgs := append([]string{policyArgsStr}, args[1:]...)
+		if err := o.handlePolicy(policyArgs); err != nil {
+			return err
+		}
+		// Add blank line between different resource type groups
+		if len(otherTypes) > 0 {
+			fmt.Fprintln(o.IOStreams.Out)
+		}
+	}
+
+	// If we have other types, handle them with the builder
+	if len(otherTypes) == 0 {
+		return nil
+	}
+
+	otherArgsStr := strings.Join(otherTypes, ",")
+	otherArgs := append([]string{otherArgsStr}, args[1:]...)
 	infos, err := o.factory.NewBuilder().
 		Unstructured().
 		Flatten().
 		NamespaceParam(o.namespace).DefaultNamespace().AllNamespaces(o.allNamespaces).
-		ResourceTypeOrNameArgs(true, args...).
+		ResourceTypeOrNameArgs(true, otherArgs...).
 		LabelSelectorParam(o.labelSelector).
 		ContinueOnError().
 		Do().
@@ -222,8 +273,63 @@ func (o *getOptions) handlePolicy(args []string) error {
 		return err
 	}
 
+	// When both policy and policycrd are requested, print them separately in order
+	if o.resourceTypes.isPolicy && o.resourceTypes.isPolicyCRD {
+		// Print in the order they were requested
+		// First pass: collect nodes for each type
+		policyNodes := []*topology.Node{}
+		crdNodes := []*topology.Node{}
+
+		// Collect policy nodes
+		for _, policy := range policyManager.GetPolicies() {
+			shouldSkip := (!o.allNamespaces && o.namespace != policy.GKNN().Namespace) ||
+				(len(args) == 2 && args[1] != policy.GKNN().Name)
+			if shouldSkip {
+				continue
+			}
+			policyNodes = append(policyNodes, encodePolicyAsNode(policy))
+		}
+
+		// Collect CRD nodes
+		for _, policyCRD := range policyManager.GetCRDs() {
+			shouldSkip := len(args) == 2 && (args[1] != policyCRD.CRD.GetName())
+			if shouldSkip {
+				continue
+			}
+			node, err := encodePolicyCRDAsNode(policyCRD)
+			if err != nil {
+				return err
+			}
+			crdNodes = append(crdNodes, node)
+		}
+
+		// Second pass: print in requested order with blank lines only when needed
+		hasOutput := false
+		for _, resType := range o.resourceTypes.policyOrder {
+			var nodesToPrint []*topology.Node
+			if resType == "policy" {
+				nodesToPrint = policyNodes
+			} else if resType == "policycrd" {
+				nodesToPrint = crdNodes
+			}
+
+			// Only print blank line if we have output and the next section has data
+			if len(nodesToPrint) > 0 {
+				if hasOutput {
+					fmt.Fprintln(o.IOStreams.Out) // Add blank line between different resource types
+				}
+				if err := o.printNodes(nodesToPrint); err != nil {
+					return err
+				}
+				hasOutput = true
+			}
+		}
+		return nil
+	}
+
+	// Single resource type - print normally
 	nodes := []*topology.Node{}
-	if o.isPolicy {
+	if o.resourceTypes.isPolicy {
 		for _, policy := range policyManager.GetPolicies() {
 			shouldSkip := (!o.allNamespaces && o.namespace != policy.GKNN().Namespace) ||
 				(len(args) == 2 && args[1] != policy.GKNN().Name)
@@ -232,7 +338,8 @@ func (o *getOptions) handlePolicy(args []string) error {
 			}
 			nodes = append(nodes, encodePolicyAsNode(policy))
 		}
-	} else {
+	}
+	if o.resourceTypes.isPolicyCRD {
 		for _, policyCRD := range policyManager.GetCRDs() {
 			shouldSkip := len(args) == 2 && (args[1] != policyCRD.CRD.GetName())
 			if shouldSkip {
@@ -267,20 +374,41 @@ func (o *getOptions) printNodes(nodes []*topology.Node) error {
 	return nil
 }
 
-func parseResourceTypeOrNameArgs(args []string) (isPolicy, isPolicyCRD bool, err error) {
+func parseResourceTypeOrNameArgs(args []string) (*resourceTypeConfig, error) {
+	config := &resourceTypeConfig{
+		isPolicy:      false,
+		isPolicyCRD:   false,
+		hasPolicy:     false,
+		hasPolicyCRD:  false,
+		policyOrder:   []string{},
+		hasOtherTypes: false,
+	}
+
+	types := []string{args[0]}
 	if strings.Contains(args[0], ",") {
-		return false, false, fmt.Errorf("cannot specify more than one type, received types: %v", strings.Split(args[0], ","))
+		types = strings.Split(args[0], ",")
 	}
 
-	switch args[0] {
-	case "policy", "policies":
-		isPolicy = true
+	for _, t := range types {
+		t = strings.TrimSpace(t)
+		switch t {
+		case "policy", "policies":
+			config.isPolicy = true
+			config.hasPolicy = true
+			config.policyOrder = append(config.policyOrder, "policy")
 
-	case "policycrd", "policycrds":
-		isPolicyCRD = true
+		case "policycrd", "policycrds":
+			config.isPolicyCRD = true
+			config.hasPolicyCRD = true
+			config.policyOrder = append(config.policyOrder, "policycrd")
+
+		default:
+			// Any other type is tracked as a non-policy type
+			config.hasOtherTypes = true
+		}
 	}
 
-	return isPolicy, isPolicyCRD, nil
+	return config, nil
 }
 
 func encodePolicyAsNode(policy *policymanager.Policy) *topology.Node {

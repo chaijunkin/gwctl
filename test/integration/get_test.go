@@ -214,6 +214,50 @@ Events:
   Warning  SYNC    Unknown  my-gateway-controller  test message
 `,
 		},
+		{
+			name:      "get gateways,httproutes -n test",
+			inputArgs: []string{"gateways,httproutes"},
+			namespace: "test",
+			wantOut: `
+NAMESPACE  NAME       CLASS                           ADDRESSES  PORTS  PROGRAMMED  AGE
+test       gateway-1  foo-com-external-gateway-class             80     Unknown     <unknown>
+test       gateway-2  bar-com-internal-gateway-class             443    Unknown     <unknown>
+NAMESPACE  NAME         HOSTNAMES                          PARENT REFS  ACCEPTED  RESOLVED  AGE
+test       httproute-1  demo.com                           1            Unknown   Unknown   <unknown>
+test       httproute-2  example.com,example2.com + 1 more  2            Unknown   Unknown   <unknown>
+`,
+		},
+		{
+			name:      "get gateways,services -n test",
+			inputArgs: []string{"gateways,services"},
+			namespace: "test",
+			wantOut: `
+NAMESPACE  NAME       CLASS                           ADDRESSES  PORTS  PROGRAMMED  AGE
+test       gateway-1  foo-com-external-gateway-class             80     Unknown     <unknown>
+test       gateway-2  bar-com-internal-gateway-class             443    Unknown     <unknown>
+NAMESPACE  NAME   TYPE     AGE
+test       svc-1  Service  <unknown>
+test       svc-2  Service  <unknown>
+`,
+		},
+		{
+			name:      "get policies,policycrds -A",
+			inputArgs: []string{"policies,policycrds"},
+			namespace: "", // All namespaces
+			wantOut: `
+NAME                                          POLICY TYPE  SCOPE       AGE
+backendtlspolicies.gateway.networking.k8s.io  Direct       Namespaced  <unknown>
+`,
+		},
+		{
+			name:      "get policycrds,policies -A",
+			inputArgs: []string{"policycrds,policies"},
+			namespace: "", // All namespaces - reversed order
+			wantOut: `
+NAME                                          POLICY TYPE  SCOPE       AGE
+backendtlspolicies.gateway.networking.k8s.io  Direct       Namespaced  <unknown>
+`,
+		},
 	}
 
 	for _, tc := range testCases {
